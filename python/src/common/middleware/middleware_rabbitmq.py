@@ -1,5 +1,4 @@
 import pika
-import signal
 from .middleware import (
     MessageMiddlewareQueue,
     MessageMiddlewareExchange,
@@ -8,17 +7,19 @@ from .middleware import (
     MessageMiddlewareCloseError,
 )
 
-# Cantidad máxima de mensajes no confirmados entregados a cada consumidor a la vez.
-# Valor 1 garantiza reparto equitativo entre consumidores concurrentes.
+# Cantidad máxima de mensajes no confirmados entregados a cada consumer a la vez.
+# Valor 1 garantiza reparto equitativo entre consumers concurrentes y evita que
+# un consumer acumule trabajo. Es clave para que el token-ring de EOFs en los
+# sums funcione correctamente (ver sum/main.py).
 PREFETCH_COUNT = 1
 
 
 def _build_pika_callback(on_message_callback):
     """
     Wrappea el callback de pika para exponer la interfaz (message, ack, nack)
-    definida por la clase abstracta, ocultando los detalles de pika al consumidor.
-    El ack y nack son invocados manualmente por el consumidor, lo que garantiza
-    que un mensaje solo se confirma tras ser procesado exitosamente (at-least-once).
+    definida por la clase abstracta, ocultando los detalles de pika al consumer.
+    El ack/nack se invocan manualmente: un mensaje solo se confirma tras ser
+    procesado exitosamente (at-least-once).
     """
     def _callback(ch, method, properties, body):
         ack = lambda: ch.basic_ack(delivery_tag=method.delivery_tag)
@@ -28,6 +29,10 @@ def _build_pika_callback(on_message_callback):
 
 
 class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
+    """
+    Cola compartida: con N consumers subscriptos, RabbitMQ reparte round-robin.
+    La cola es durable para sobrevivir reinicios del broker.
+    """
 
     def __init__(self, host, queue_name):
         self._queue_name = queue_name
@@ -37,58 +42,64 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
 
         try:
             self._connection = pika.BlockingConnection(
-                pika.ConnectionParameters(host=host)
+                pika.ConnectionParameters(host=host, heartbeat=600)
             )
             self._channel = self._connection.channel()
-            # durable=True: la cola sobrevive reinicios del broker.
             self._channel.queue_declare(queue=queue_name, durable=True)
         except pika.exceptions.AMQPConnectionError as e:
-            raise MessageMiddlewareDisconnectedError(f"Failed to connect to RabbitMQ: {e}")
-
-        signal.signal(signal.SIGTERM, self._handle_sigterm)
-
-    def _handle_sigterm(self, signum, frame):
-        self.close()
+            raise MessageMiddlewareDisconnectedError(
+                f"Failed to connect to RabbitMQ: {e}"
+            )
 
     def start_consuming(self, on_message_callback):
         try:
-            # prefetch_count=1 evita que un consumidor acumule mensajes.
             self._channel.basic_qos(prefetch_count=PREFETCH_COUNT)
             self._consumer_tag = self._channel.basic_consume(
                 queue=self._queue_name,
                 on_message_callback=_build_pika_callback(on_message_callback),
-                auto_ack=False
+                auto_ack=False,
             )
             self._channel.start_consuming()
         except pika.exceptions.AMQPConnectionError as e:
-            raise MessageMiddlewareDisconnectedError(f"Connection lost while consuming: {e}")
+            raise MessageMiddlewareDisconnectedError(
+                f"Connection lost while consuming: {e}"
+            )
         except pika.exceptions.AMQPError as e:
             raise MessageMiddlewareMessageError(f"Error while consuming: {e}")
         finally:
-            # Se limpia el tag independientemente de cómo terminó el loop, para que stop_consuming no intente detener un consumer inexistente.
             self._consumer_tag = None
 
     def stop_consuming(self):
         """
-        Detiene el loop de consumo si esta instancia tenía un consumer activo.
-        Si no se estaba consumiendo, no tiene efecto.
+        Thread-safe: puede invocarse desde un signal handler u otro hilo,
+        ya que agenda la detención en el event loop de pika.
         """
+        if not self._connection or not self._connection.is_open:
+            return
         try:
-            if self._channel and self._channel.is_open and self._consumer_tag:
-                self._channel.stop_consuming()
+            self._connection.add_callback_threadsafe(self._safe_stop)
         except pika.exceptions.AMQPConnectionError as e:
-            raise MessageMiddlewareDisconnectedError(f"Connection lost while stopping: {e}")
+            raise MessageMiddlewareDisconnectedError(
+                f"Connection lost while stopping: {e}"
+            )
+
+    def _safe_stop(self):
+        if self._channel and self._channel.is_open and self._consumer_tag:
+            self._channel.stop_consuming()
 
     def send(self, message):
         try:
-            # exchange='' usa el exchange defult de RabbitMQ que rutea directamente a la cola cuyo nombre coincide con la routing_key
+            # exchange='' = default exchange: rutea directo a la cola con
+            # nombre igual al routing_key.
             self._channel.basic_publish(
-                exchange='',
+                exchange="",
                 routing_key=self._queue_name,
                 body=message,
             )
         except pika.exceptions.AMQPConnectionError as e:
-            raise MessageMiddlewareDisconnectedError(f"Conection lost while sending: {e}")
+            raise MessageMiddlewareDisconnectedError(
+                f"Connection lost while sending: {e}"
+            )
         except pika.exceptions.AMQPError as e:
             raise MessageMiddlewareMessageError(f"Error while sending: {e}")
 
@@ -103,72 +114,86 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
 
 
 class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
+    """
+    Exchange direct con routing keys explícitas.
+    La cola consumer se crea lazy al llamar start_consuming para evitar que
+    una instancia que solo publica cree colas anónimas fantasma que acumulan
+    mensajes sin consumer (memory leak en el broker).
+    """
 
     def __init__(self, host, exchange_name, routing_keys):
         self._exchange_name = exchange_name
         self._routing_keys = routing_keys
         self._channel = None
         self._connection = None
-        self._queue_name = None
+        self._queue_name = None  # Se setea solo si se consume
         self._consumer_tag = None
 
         try:
             self._connection = pika.BlockingConnection(
-                pika.ConnectionParameters(host=host)
+                pika.ConnectionParameters(host=host, heartbeat=600)
             )
             self._channel = self._connection.channel()
             self._channel.exchange_declare(
                 exchange=exchange_name,
-                exchange_type='direct',
-                durable=True
+                exchange_type="direct",
+                durable=True,
             )
-            # Cola exclusiva y anónima por instancia: RabbitMQ genera un nombre único y la elimina al cerrar la conexión. Necesaria para broadcast:
-            # cada consumer tiene su propia cola bindeada a la routing key, por lo que recibe su propia copia de cada mensaje.
-            result = self._channel.queue_declare(queue='', exclusive=True)
-            self._queue_name = result.method.queue
-            for routing_key in routing_keys:
-                self._channel.queue_bind(
-                    exchange=exchange_name,
-                    queue=self._queue_name,
-                    routing_key=routing_key
-                )
         except pika.exceptions.AMQPConnectionError as e:
-            raise MessageMiddlewareDisconnectedError(f"Filed to connect to RabitMQ: {e}")
+            raise MessageMiddlewareDisconnectedError(
+                f"Failed to connect to RabbitMQ: {e}"
+            )
 
-        signal.signal(signal.SIGTERM, self._handle_sigterm)
-
-    def _handle_sigterm(self, signum, frame):
-        self.close()
+    def _declare_consumer_queue(self):
+        """
+        Crea una cola exclusiva anónima bindeada a las routing keys. Solo se
+        invoca cuando esta instancia va a consumir, no cuando solo publica.
+        """
+        result = self._channel.queue_declare(queue="", exclusive=True)
+        self._queue_name = result.method.queue
+        for routing_key in self._routing_keys:
+            self._channel.queue_bind(
+                exchange=self._exchange_name,
+                queue=self._queue_name,
+                routing_key=routing_key,
+            )
 
     def start_consuming(self, on_message_callback):
         try:
+            if self._queue_name is None:
+                self._declare_consumer_queue()
             self._channel.basic_qos(prefetch_count=PREFETCH_COUNT)
             self._consumer_tag = self._channel.basic_consume(
                 queue=self._queue_name,
                 on_message_callback=_build_pika_callback(on_message_callback),
-                auto_ack=False
+                auto_ack=False,
             )
             self._channel.start_consuming()
         except pika.exceptions.AMQPConnectionError as e:
-            raise MessageMiddlewareDisconnectedError(f"Connection lost while consuming: {e}")
+            raise MessageMiddlewareDisconnectedError(
+                f"Connection lost while consuming: {e}"
+            )
         except pika.exceptions.AMQPError as e:
             raise MessageMiddlewareMessageError(f"Error while consuming: {e}")
         finally:
             self._consumer_tag = None
 
     def stop_consuming(self):
-        """
-        Detiene el loop de consumo si esta instancia tenía un consumer activo.
-        Si no se estaba consumiendo, no tiene efecto.
-        """
+        if not self._connection or not self._connection.is_open:
+            return
         try:
-            if self._channel and self._channel.is_open and self._consumer_tag:
-                self._channel.stop_consuming()
+            self._connection.add_callback_threadsafe(self._safe_stop)
         except pika.exceptions.AMQPConnectionError as e:
-            raise MessageMiddlewareDisconnectedError(f"Connection lost while stopping: {e}")
+            raise MessageMiddlewareDisconnectedError(
+                f"Connection lost while stopping: {e}"
+            )
+
+    def _safe_stop(self):
+        if self._channel and self._channel.is_open and self._consumer_tag:
+            self._channel.stop_consuming()
 
     def send(self, message):
-        # Según el criterio de la cátedra, send publica a todas las routing keys configuradas en esta instanciq
+        # Publica a todas las routing keys configuradas en esta instancia.
         try:
             for routing_key in self._routing_keys:
                 self._channel.basic_publish(
@@ -177,7 +202,9 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
                     body=message,
                 )
         except pika.exceptions.AMQPConnectionError as e:
-            raise MessageMiddlewareDisconnectedError(f"Connection lost while sending: {e}")
+            raise MessageMiddlewareDisconnectedError(
+                f"Connection lost while sending: {e}"
+            )
         except pika.exceptions.AMQPError as e:
             raise MessageMiddlewareMessageError(f"Error while sending: {e}")
 
