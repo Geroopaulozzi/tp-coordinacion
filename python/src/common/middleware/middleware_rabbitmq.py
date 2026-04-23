@@ -89,8 +89,6 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
 
     def send(self, message):
         try:
-            # exchange='' = default exchange: rutea directo a la cola con
-            # nombre igual al routing_key.
             self._channel.basic_publish(
                 exchange="",
                 routing_key=self._queue_name,
@@ -116,17 +114,24 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
 class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
     """
     Exchange direct con routing keys explícitas.
-    La cola consumer se crea lazy al llamar start_consuming para evitar que
-    una instancia que solo publica cree colas anónimas fantasma que acumulan
-    mensajes sin consumer (memory leak en el broker).
+
+    Si consume=True (default), la cola y los bindings se crean en __init__,
+    de modo que cualquier mensaje publicado antes de start_consuming queda
+    encolado y no se pierde. Esto es crítico para evitar la race condition
+    entre el arranque de los Sums y los Aggregators: en un direct exchange,
+    un mensaje publicado sin ninguna cola bindeada a esa routing key se
+    descarta silenciosamente.
+
+    Si consume=False, esta instancia solo publica y no crea ninguna cola.
+    Usarlo desde los Sums al construir los exchanges hacia los Aggregators.
     """
 
-    def __init__(self, host, exchange_name, routing_keys):
+    def __init__(self, host, exchange_name, routing_keys, consume=True):
         self._exchange_name = exchange_name
         self._routing_keys = routing_keys
         self._channel = None
         self._connection = None
-        self._queue_name = None  # Se setea solo si se consume
+        self._queue_name = None
         self._consumer_tag = None
 
         try:
@@ -139,6 +144,11 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
                 exchange_type="direct",
                 durable=True,
             )
+            if consume:
+                # Declarar y bindear en __init__ para que los mensajes que
+                # lleguen antes de start_consuming queden encolados en vez
+                # de descartarse.
+                self._declare_consumer_queue()
         except pika.exceptions.AMQPConnectionError as e:
             raise MessageMiddlewareDisconnectedError(
                 f"Failed to connect to RabbitMQ: {e}"
@@ -146,8 +156,9 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
 
     def _declare_consumer_queue(self):
         """
-        Crea una cola exclusiva anónima bindeada a las routing keys. Solo se
-        invoca cuando esta instancia va a consumir, no cuando solo publica.
+        Crea una cola exclusiva anónima bindeada a las routing keys.
+        Al ser exclusive=True, RabbitMQ la elimina automáticamente cuando
+        se cierra la conexión, sin dejar colas huérfanas en el broker.
         """
         result = self._channel.queue_declare(queue="", exclusive=True)
         self._queue_name = result.method.queue
@@ -160,8 +171,6 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
 
     def start_consuming(self, on_message_callback):
         try:
-            if self._queue_name is None:
-                self._declare_consumer_queue()
             self._channel.basic_qos(prefetch_count=PREFETCH_COUNT)
             self._consumer_tag = self._channel.basic_consume(
                 queue=self._queue_name,
@@ -193,7 +202,6 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
             self._channel.stop_consuming()
 
     def send(self, message):
-        # Publica a todas las routing keys configuradas en esta instancia.
         try:
             for routing_key in self._routing_keys:
                 self._channel.basic_publish(
